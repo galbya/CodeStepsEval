@@ -1,141 +1,229 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT license.
+# Original Copyright 2021 OpenAI under MIT License.
+# Modifications Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
-import statistics
-import numpy as np
-from collections import defaultdict
-import logging
-from typing import List, Union
 import itertools
+import os
+import time
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Iterable, List, Union
 
-logging.basicConfig(
-    format="SystemLog: [%(asctime)s][%(name)s][%(levelname)s] - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
+import numpy as np
+import tqdm
+import json
+from data import read_problems, stream_jsonl, write_jsonl
+
+# Amazon modification
+# import check correctness for all languages
+from execution import (
+    check_correctness,
+    check_correctness_cpp,
+    check_correctness_csharp,
+    check_correctness_go,
+    check_correctness_java,
+    check_correctness_javascript,
+    check_correctness_kotlin,
+    check_correctness_perl,
+    check_correctness_php,
+    check_correctness_ruby,
+    check_correctness_scala,
+    check_correctness_swift,
+    check_correctness_typescript,
+)
+from execution_with_test_cases import (
+    check_cpp_correctness_with_test_cases,
+    check_python_correctness_with_test_cases,
 )
 
-logger = logging.getLogger(__name__)
 
-def _dictionized_ground_truth_results(ground_truth_exec_results):
-    ground_truth_results_by_task_and_solution = defaultdict(defaultdict)
-    for result in ground_truth_exec_results:
-        ground_truth_results_by_task_and_solution[result['task_id']][result['completion']] = result['passed']
-    return ground_truth_results_by_task_and_solution
-
-def _turn_solution_scores_into_choose_count(sorted_solution_scores, topk):
-    # sorted_solution_scores: list of (solution, score)
-    # if wrapped, sorted_solution_scores is list of ([solutions], score)
-    # return list of (solution, choose_count)
-    wrapped = True if type(sorted_solution_scores[0][0]) == list else False
-    result = []
-    if wrapped:
-        last_score = sorted_solution_scores[0][1]
-        merged_solutions_and_score = [sorted_solution_scores[0]]
-        for solutions, score in sorted_solution_scores[1:]:
-            if score == last_score:
-                last_solutions = merged_solutions_and_score[-1][0]
-                merged_solutions_and_score[-1] = (last_solutions + solutions, score)
-            else:
-                merged_solutions_and_score.append((solutions, score))
-                last_score = score
-        for solutions_and_score in merged_solutions_and_score:
-            result.append((solutions_and_score[0], 1))  # choose one from solutions_and_score
-    else:
-        topk_scores = sorted(list(set([i[1] for i in sorted_solution_scores])), reverse=True)
-        for score in topk_scores:
-            solutions = [s[0] for s in sorted_solution_scores if s[1] == score]
-            result.append((solutions, 1))
-
-    if len(result) >= topk:
-        return result[:topk]
-    else:
-        intial_choose_count = [1]*len(result)
-        for i in range(topk-len(result)):
-            intial_choose_count[i%len(result)] += 1
-        for i, choose_count in enumerate(intial_choose_count):
-            result[i] = (result[i][0], choose_count)
-        return result
-    
-
-def get_result_of_sorted_solutions(ground_truth_results_list, sorted_solutions_by_task, topks=[1,2,10]):
-    # sorted_solutions_by_task {task_id: [([solutions], score), ...]}
-    def _count_correct(solutions: list, ground_truth_results: dict) -> int:
-        return sum([ground_truth_results[s] for s in solutions])
-    
-    ground_truth_results = _dictionized_ground_truth_results(ground_truth_results_list)
-    topk_results = dict()
-    for topk in topks:
-        random_pass_at_k_by_task = pass_at_K_by_task(ground_truth_results_list, k=topk)
-        pass_rates = []
-        for task_id in ground_truth_results.keys():
-            all_wrong_probability = 1
-            if task_id in sorted_solutions_by_task and sorted_solutions_by_task[task_id]:
-                solutions_and_probability = _turn_solution_scores_into_choose_count(sorted_solutions_by_task[task_id], topk)
-                for solutions, choose_count in solutions_and_probability:
-                    current_wrong_prob = _estimator(len(solutions), _count_correct(solutions, ground_truth_results[task_id]), 1)
-                    repeat_current_wrong_prob = pow(current_wrong_prob, choose_count)
-                    all_wrong_probability *= repeat_current_wrong_prob
-                pass_rates.append(1-all_wrong_probability)
-            else:
-                pass_rates.append(random_pass_at_k_by_task[task_id])
-        
-        # the avg rate of all tasks
-        topk_results[f'pass@{topk}'] = round(statistics.mean(pass_rates), 4)
-    logger.info(topk_results)
-
-def pass_at_K_by_task(results, k):
-    result_dict = defaultdict(list)
-    for line in results:
-        result_dict[line['task_id']].append(line['passed'])
-    result = dict()
-    for task_id in result_dict.keys():
-        total = len(result_dict[task_id])
-        correct = sum(result_dict[task_id])
-        score = _estimate_pass_at_k(total, [correct], k)[0]
-        result[task_id] = score
-    return result
-
-def pass_at_K(results, k = [1, 10, 100]):
-    def _turn_list_into_dict(result_lines):
-        result_dict = defaultdict(list)
-        for line in result_lines:
-            result_dict[line['task_id']].append(line['passed'])
-        return result_dict
-
-    # Calculate pass@k.
-    total, correct = [], []
-    for passed in _turn_list_into_dict(results).values():
-        total.append(len(passed))
-        correct.append(sum(passed))
-
-    total = np.array(total)
-    correct = np.array(correct)
-
-    ks = k
-    pass_at_k = {f"pass@{k}": round(_estimate_pass_at_k(total, correct, k).mean(), 4)
-                 for k in ks if (total >= k).all()}
-    logger.info(pass_at_k)
-
-def _estimator(n: int, c: int, k: int) -> float:
-    """
-    Calculates comb(n - c, k) / comb(n, k).
-    """
-    if n - c < k:
-        return 0
-    return np.prod(1.0 - k / np.arange(n - c + 1, n + 1))
-
-def _estimate_pass_at_k(
+def estimate_pass_at_k(
     num_samples: Union[int, List[int], np.ndarray],
     num_correct: Union[List[int], np.ndarray],
-    k: int
+    k: int,
 ) -> np.ndarray:
     """
     Estimates pass@k of each problem and returns them in an array.
     """
+
+    def estimator(n: int, c: int, k: int) -> float:
+        """
+        Calculates 1 - comb(n - c, k) / comb(n, k).
+        """
+        if n - c < k:
+            return 1.0
+        return 1.0 - np.prod(1.0 - k / np.arange(n - c + 1, n + 1))
+
     if isinstance(num_samples, int):
         num_samples_it = itertools.repeat(num_samples, len(num_correct))
     else:
         assert len(num_samples) == len(num_correct)
         num_samples_it = iter(num_samples)
 
-    return np.array([1.0 - _estimator(int(n), int(c), k) for n, c in zip(num_samples_it, num_correct)])
+    return np.array(
+        [estimator(int(n), int(c), k) for n, c in zip(num_samples_it, num_correct)]
+    )
+
+
+def evaluate_functional_correctness(
+    sample_file: str,
+    k: List[int] = [1, 10, 100],
+    n_workers: int = os.cpu_count() - 1,
+    timeout: float = 10.0,
+    problem_file: str = "data/CodeStepsEval277-CPP.jsonl",
+    result_path: str = "results",
+    with_test_cases: bool = False
+):
+    """
+    Evaluates the functional correctness of generated samples, and writes
+    results to f"{sample_file}_results.jsonl"
+    """
+
+    check_correctness_map = {
+            "python": check_correctness,
+            "java": check_correctness_java,
+            "javascript": check_correctness_javascript,
+            "typescript": check_correctness_typescript,
+            "kotlin": check_correctness_kotlin,
+            "ruby": check_correctness_ruby,
+            "php": check_correctness_php,
+            "cpp": check_correctness_cpp,
+            "csharp": check_correctness_csharp,
+            "go": check_correctness_go,
+            "perl": check_correctness_perl,
+            "scala": check_correctness_scala,
+            "swift": check_correctness_swift,
+        }
+
+    check_correctness_with_test_cases_map = {
+        "cpp": check_cpp_correctness_with_test_cases,
+        "python": check_python_correctness_with_test_cases,
+    }
+
+    problems = read_problems(problem_file)
+
+    # see execution.py for details
+    # Check the generated samples against test suites.
+
+    check_correctness_map_to_use = check_correctness_with_test_cases_map if with_test_cases else check_correctness_map
+    
+    seed = int(time.time() * 1000000) % 1000000
+    np.random.seed(seed=seed)  # microsecond
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = []
+        completion_id = Counter()
+        n_samples = 0
+        results = defaultdict(list)
+
+        print("Reading samples...")
+        for sample in tqdm.tqdm(stream_jsonl(sample_file)):
+            task_id = sample["task_id"]
+            completion = sample["completion"]
+            language = sample["language"]
+            if with_test_cases:
+                args = {
+                    "problem": problems[task_id], 
+                    "completion": completion, 
+                    "timeout": timeout, 
+                    "completion_id": completion_id[task_id], 
+                    "language": language, 
+                    "extension": ".cpp", 
+                    "compile_command_lambda": lambda x: ["g++", "-std=c++14", f"{os.path.basename(x)}.cpp", "-o", f"{os.path.basename(x)}_cpp"],
+                    "compile_timeout": 100,
+                    "subprocess_command_lambda": lambda x: [f"./{os.path.basename(x)}_cpp"],
+                    "extra_cleanup": lambda x: f"{x}_cpp",
+                    "cwd": True
+                }
+            else:
+                args = {
+                    "problem": problems[task_id], 
+                    "completion": completion, 
+                    "timeout": timeout, 
+                    "completion_id": completion_id[task_id]
+                }
+            
+            check_correctness_function = check_correctness_map_to_use[language]
+            future = executor.submit(check_correctness_function, **args)
+            futures.append(future)
+            completion_id[task_id] += 1
+            n_samples += 1
+
+        assert len(completion_id) == len(problems), "Some problems are not attempted."
+
+        print("Running test suites...")
+        for future in tqdm.tqdm(as_completed(futures), total=len(futures)):
+            result = future.result()  # this is the execution stage
+            results[result["task_id"]].append((result["completion_id"], result))
+
+    # common code for all languages
+    # Calculate pass@k.
+    total, correct = [], []
+    for result in results.values():
+        result.sort()
+        passed = [r[1]["passed"] for r in result]
+        total.append(len(passed))
+        correct.append(sum(passed))
+    total = np.array(total)
+    correct = np.array(correct)
+
+    ks = k
+    pass_at_k = {
+        f"pass@{k}": estimate_pass_at_k(total, correct, k).mean()
+        for k in ks
+        if (total >= k).all()
+    }
+
+    # Finally, save the results in one file:
+    def combine_results():
+        for sample in stream_jsonl(sample_file):
+            task_id = sample["task_id"]
+            result = results[task_id].pop(0)
+            sample["result"] = result[1]["result"]
+            sample["passed"] = result[1]["passed"]
+            sample["completion_id"] = result[1]["completion_id"]
+            sample["time_elapsed"] = result[1]["time_elapsed"]
+            sample["compiled"] = result[1]["compiled"]
+            if "error_message" in result[1]:
+                sample["error_message"] = result[1]["error_message"]
+            if "status" in result[1]:
+                sample["status"] = result[1]["status"]
+            yield sample
+
+    file_name = sample_file.split("/")[-1].split('.jsonl')[0]
+    out_file = os.path.join(result_path, file_name + "_results.jsonl")
+    out_file_passatk = os.path.join(result_path, file_name + "_passatk.json")
+
+    os.makedirs(result_path, exist_ok=True)
+    print(f"Writing results to {out_file}...")
+    write_jsonl(out_file, tqdm.tqdm(combine_results(), total=n_samples))
+
+    with open(out_file_passatk, "w") as f:
+        f.write(json.dumps(pass_at_k))
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sample_file", type=str, default="test_data/CodeStepsEval277_CPP_CodeLlama_test_samples.jsonl")
+    parser.add_argument("--problem_file", type=str, default="data/CodeStepsEval277-CPP.jsonl")
+    parser.add_argument("--k", type=str, default="1,3,5,10,100")
+    parser.add_argument("--n_workers", type=int, default=os.cpu_count() - 1)
+    parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument("--result_path", type=str, default="results")
+    parser.add_argument("--with_test_cases", action="store_true")
+    args = parser.parse_args()
+
+    k_values = [int(k) for k in args.k.split(',')]
+
+    evaluate_functional_correctness(
+        sample_file=args.sample_file,
+        problem_file=args.problem_file,
+        k=k_values,
+        n_workers=args.n_workers,
+        timeout=args.timeout,
+        result_path=args.result_path,
+        with_test_cases=args.with_test_cases
+    )
+
+
+if __name__ == "__main__":
+    main()
